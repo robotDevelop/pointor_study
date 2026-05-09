@@ -52,10 +52,10 @@ class PortfolioManager:
         self._cash: int = 0
         self._total_value: int = 0
 
-    def sync_from_kiwoom(self) -> None:
+    async def sync_from_kiwoom(self) -> None:
         """키움 API에서 실제 잔고를 가져와 포트폴리오를 동기화한다."""
         try:
-            balance = self.kiwoom.get_account_balance(self.account_no, self.account_pw)
+            balance = await self.kiwoom.get_account_balance(self.account_no, self.account_pw)
             summary = balance["summary"]
             self._cash = int(summary.get("deposit", "0").replace(",", "") or 0)
             self._total_value = int(summary.get("total_evaluate", "0").replace(",", "") or 0)

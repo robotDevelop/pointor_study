@@ -5,7 +5,7 @@ from src.ai.base_analyzer import Action
 from src.ai.decision_maker import TradingDecision
 from src.kiwoom.api import KiwoomAPI
 from src.kiwoom.constants import OrderType, PriceType
-from src.trading.portfolio_manager import PortfolioManager, Position, TradeRecord
+from src.trading.portfolio_manager import PortfolioManager, TradeRecord
 from src.trading.risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
@@ -34,14 +34,14 @@ class OrderManager:
     def resume_new_buys(self) -> None:
         self._allow_new_buys = True
 
-    def execute_decision(self, decision: TradingDecision) -> bool:
+    async def execute_decision(self, decision: TradingDecision) -> bool:
         if decision.final_action == Action.BUY:
-            return self._execute_buy(decision)
+            return await self._execute_buy(decision)
         elif decision.final_action == Action.SELL:
-            return self._execute_sell(decision)
+            return await self._execute_sell(decision)
         return True  # HOLD: 아무 행동 없음
 
-    def _execute_buy(self, decision: TradingDecision) -> bool:
+    async def _execute_buy(self, decision: TradingDecision) -> bool:
         risk_result = self.risk.check_buy(
             stock_code=decision.stock_code,
             current_price=decision.target_price or 1,
@@ -57,7 +57,7 @@ class OrderManager:
             return False
 
         try:
-            self.kiwoom.place_order(
+            await self.kiwoom.place_order(
                 order_type=OrderType.BUY,
                 stock_code=decision.stock_code,
                 quantity=risk_result.adjusted_quantity,
@@ -66,7 +66,6 @@ class OrderManager:
                 price_type=PriceType.MARKET,
             )
             self.risk.increment_trade_count()
-
             self.portfolio.record_trade(TradeRecord(
                 code=decision.stock_code,
                 name=decision.stock_name,
@@ -86,7 +85,7 @@ class OrderManager:
             logger.error(f"매수 주문 실패 [{decision.stock_name}]: {e}")
             return False
 
-    def _execute_sell(self, decision: TradingDecision, forced: bool = False) -> bool:
+    async def _execute_sell(self, decision: TradingDecision, forced: bool = False) -> bool:
         position = self.portfolio.get_position(decision.stock_code)
         if not position:
             return False
@@ -104,7 +103,7 @@ class OrderManager:
             return False
 
         try:
-            self.kiwoom.place_order(
+            await self.kiwoom.place_order(
                 order_type=OrderType.SELL,
                 stock_code=decision.stock_code,
                 quantity=position.quantity,
@@ -113,7 +112,6 @@ class OrderManager:
                 price_type=PriceType.MARKET,
             )
             self.risk.increment_trade_count()
-
             pnl = (position.current_price - position.avg_buy_price) * position.quantity
             self.portfolio.record_trade(TradeRecord(
                 code=decision.stock_code,
@@ -135,7 +133,7 @@ class OrderManager:
             logger.error(f"매도 주문 실패 [{decision.stock_name}]: {e}")
             return False
 
-    def sell_by_stop_loss(self, stock_code: str) -> bool:
+    async def sell_by_stop_loss(self, stock_code: str) -> bool:
         position = self.portfolio.get_position(stock_code)
         if not position:
             return False
@@ -149,12 +147,12 @@ class OrderManager:
             consensus=False,
             target_price=position.current_price,
             stop_loss_price=position.current_price,
-            reasoning_summary="손절 트리거",
+            reasoning_summary="손절/익절 트리거",
         )
-        logger.warning(f"손절 실행: {position.name} ({position.unrealized_pnl_pct:.1%})")
-        return self._execute_sell(decision, forced=True)
+        logger.warning(f"손절/익절 실행: {position.name} ({position.unrealized_pnl_pct:.1%})")
+        return await self._execute_sell(decision, forced=True)
 
-    def close_all_positions(self) -> None:
+    async def close_all_positions(self) -> None:
         """장 마감 전 전체 포지션 강제 청산"""
         logger.info(f"전체 포지션 청산 시작: {len(self.portfolio._positions)}개")
         for code, position in list(self.portfolio._positions.items()):
@@ -170,4 +168,4 @@ class OrderManager:
                 stop_loss_price=position.current_price,
                 reasoning_summary="장 마감 청산",
             )
-            self._execute_sell(decision, forced=True)
+            await self._execute_sell(decision, forced=True)

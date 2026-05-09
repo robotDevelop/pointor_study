@@ -8,12 +8,15 @@ from dotenv import load_dotenv
 
 @dataclass
 class KiwoomConfig:
+    # REST API 인증 (키움 개발자 포털에서 발급)
+    app_key: str = ""
+    app_secret: str = ""
     account_number: str = ""
     account_password: str = ""
-    cert_password: str = ""
     is_simulated: bool = True
+    # REST API 기본 URL (키움 개발자 포털 참조)
+    base_url: str = "https://openapi.kiwoom.com:9443"
     tr_delay_ms: int = 200
-    real_delay_ms: int = 500
 
 
 @dataclass
@@ -76,9 +79,10 @@ def load_config(config_path: str = "config/config.yaml") -> AppConfig:
             raw = yaml.safe_load(f) or {}
 
     kiwoom_raw = raw.get("kiwoom", {})
-    kiwoom_raw["account_number"] = os.getenv("KIWOOM_ACCOUNT", kiwoom_raw.get("account_number", ""))
+    kiwoom_raw["app_key"]        = os.getenv("KIWOOM_APP_KEY",    kiwoom_raw.get("app_key", ""))
+    kiwoom_raw["app_secret"]     = os.getenv("KIWOOM_APP_SECRET", kiwoom_raw.get("app_secret", ""))
+    kiwoom_raw["account_number"] = os.getenv("KIWOOM_ACCOUNT",    kiwoom_raw.get("account_number", ""))
     kiwoom_raw["account_password"] = os.getenv("KIWOOM_ACCOUNT_PW", kiwoom_raw.get("account_password", ""))
-    kiwoom_raw["cert_password"] = os.getenv("KIWOOM_CERT_PW", kiwoom_raw.get("cert_password", ""))
 
     openai_raw = raw.get("openai", {})
     openai_raw["api_key"] = os.getenv("OPENAI_API_KEY", openai_raw.get("api_key", ""))

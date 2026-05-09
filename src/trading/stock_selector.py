@@ -1,8 +1,8 @@
+import asyncio
 import logging
 from typing import Dict, List
 
 from src.kiwoom.api import KiwoomAPI
-from src.kiwoom.constants import Market
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +43,12 @@ class StockSelector:
     def __init__(self, kiwoom: KiwoomAPI):
         self.kiwoom = kiwoom
 
-    def get_top_stocks(self, top_n: int = 20) -> List[Dict[str, str]]:
+    async def get_top_stocks(self, top_n: int = 20) -> List[Dict[str, str]]:
         try:
-            volume_stocks = self.kiwoom.get_popular_stocks(top_n=top_n * 2)
-            netbuy_stocks = self.kiwoom.get_net_buy_stocks(top_n=top_n * 2)
+            volume_stocks, netbuy_stocks = await asyncio.gather(
+                self.kiwoom.get_popular_stocks(top_n=top_n * 2),
+                self.kiwoom.get_net_buy_stocks(top_n=top_n * 2),
+            )
             merged = self._rank_and_merge(volume_stocks, netbuy_stocks, top_n)
             logger.info(f"인기 종목 {len(merged)}개 선정: {[s['name'] for s in merged]}")
             return merged

@@ -1,10 +1,11 @@
 kiwoom:
+  app_key: ""               # env: KIWOOM_APP_KEY    (키움 개발자 포털 발급)
+  app_secret: ""            # env: KIWOOM_APP_SECRET (키움 개발자 포털 발급)
   account_number: ""        # env: KIWOOM_ACCOUNT
   account_password: ""      # env: KIWOOM_ACCOUNT_PW
-  cert_password: ""         # env: KIWOOM_CERT_PW
   is_simulated: true        # true = 모의투자, false = 실계좌
+  base_url: "https://openapi.kiwoom.com:9443"
   tr_delay_ms: 200
-  real_delay_ms: 500
 
 openai:
   api_key: ""               # env: OPENAI_API_KEY

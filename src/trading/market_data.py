@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -66,12 +67,14 @@ class MarketDataFetcher:
     def __init__(self, kiwoom: KiwoomAPI):
         self.kiwoom = kiwoom
 
-    def fetch_stock_data(self, stock_code: str, stock_name: str) -> StockData:
-        info = self.kiwoom.get_stock_info(stock_code)
-        raw_ohlcv = self.kiwoom.get_daily_ohlcv(
-            stock_code,
-            start_date=days_ago_str(120),
-            end_date=today_str(),
+    async def fetch_stock_data(self, stock_code: str, stock_name: str) -> StockData:
+        info, raw_ohlcv = await asyncio.gather(
+            self.kiwoom.get_stock_info(stock_code),
+            self.kiwoom.get_daily_ohlcv(
+                stock_code,
+                start_date=days_ago_str(120),
+                end_date=today_str(),
+            ),
         )
         df = self._to_dataframe(raw_ohlcv)
         indicators = self._compute_indicators(df)

@@ -1,325 +1,339 @@
+"""
+키움증권 REST API 클라이언트 (Linux/Mac/Windows 공통)
+- COM/QAxWidget 없이 순수 HTTP 방식
+- 키움 개발자 포털: https://apiportal.kiwoom.com
+- 토큰 자동 갱신, 속도 제한 내장
+"""
+import asyncio
 import logging
+import time as _time
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import QEventLoop
+import httpx
 
 from config.settings import KiwoomConfig
-from src.kiwoom.constants import FID, OrderType, PriceType, Screen, TR
+from src.kiwoom.constants import OrderType, PriceType, Screen
 from src.kiwoom.exceptions import KiwoomLoginError, KiwoomOrderError, KiwoomTRError
 from src.utils.rate_limiter import RateLimiter
 from src.utils.time_utils import today_str, days_ago_str
 
 logger = logging.getLogger(__name__)
 
+# 실시간 콜백 타입
+RealCallback = Callable[[str, Dict[str, str]], None]
 
-class KiwoomAPI(QAxWidget):
+
+class KiwoomAPI:
     """
-    키움 OpenAPI+ COM 컨트롤 래퍼.
-    모든 TR 요청은 CommRqData → QEventLoop.exec_() → OnReceiveTrData 콜백 패턴으로 동기화한다.
+    키움증권 REST API 비동기 클라이언트.
+
+    토큰은 발급 후 내부적으로 캐시하며 만료 10분 전에 자동 갱신한다.
+    모든 TR 요청은 속도 제한(0.2초 간격)이 적용된다.
     """
 
-    CLSID = "{A1574A0D-6BFA-4BD7-9020-DED88711818D}"
+    TOKEN_PATH    = "/oauth2/token"
+    PRICE_PATH    = "/uapi/domestic-stock/v1/quotations/inquire-price"
+    DAILY_PATH    = "/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+    VOLUME_PATH   = "/uapi/domestic-stock/v1/ranking/volume"
+    NETBUY_PATH   = "/uapi/domestic-stock/v1/ranking/investor-netbuy"
+    INFO_PATH     = "/uapi/domestic-stock/v1/quotations/search-stock-info"
+    ORDER_PATH    = "/uapi/domestic-stock/v1/trading/order-cash"
+    BALANCE_PATH  = "/uapi/domestic-stock/v1/trading/inquire-balance"
+    DEPOSIT_PATH  = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
 
     def __init__(self, config: KiwoomConfig):
-        super().__init__()
-        self.setControl(self.CLSID)
         self.config = config
-        self._rate_limiter = RateLimiter(
-            tr_delay=config.tr_delay_ms / 1000.0,
-            real_delay=config.real_delay_ms / 1000.0,
+        self._rate_limiter = RateLimiter(tr_delay=config.tr_delay_ms / 1000.0)
+        self._token: Optional[str] = None
+        self._token_expires_at: float = 0.0
+        self._client: Optional[httpx.AsyncClient] = None
+        self._real_callbacks: Dict[str, RealCallback] = {}
+
+    # ──────────────────────────────────────────────────────────────
+    # 세션 관리
+    # ──────────────────────────────────────────────────────────────
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=self.config.base_url,
+                timeout=30.0,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+    # ──────────────────────────────────────────────────────────────
+    # 인증 / 토큰 관리
+    # ──────────────────────────────────────────────────────────────
+    async def login(self) -> bool:
+        try:
+            await self._refresh_token()
+            logger.info("키움 REST API 로그인 성공")
+            return True
+        except Exception as e:
+            logger.error(f"키움 REST API 로그인 실패: {e}")
+            return False
+
+    async def logout(self) -> None:
+        await self.close()
+        self._token = None
+
+    async def _refresh_token(self) -> None:
+        client = await self._get_client()
+        resp = await client.post(
+            self.TOKEN_PATH,
+            json={
+                "grant_type": "client_credentials",
+                "appkey": self.config.app_key,
+                "secretkey": self.config.app_secret,
+            },
         )
-        self._login_loop = QEventLoop()
-        self._tr_loop = QEventLoop()
-        self._tr_data: Dict[str, Any] = {}
-        self._real_callbacks: Dict[str, Callable] = {}
-        self._connect_signals()
+        resp.raise_for_status()
+        data = resp.json()
+        self._token = data["access_token"]
+        expires_in = int(data.get("expires_in", 86400))
+        self._token_expires_at = _time.monotonic() + expires_in - 600  # 10분 전 갱신
 
-    # ──────────────────────────────────────────────────────────────
-    # 시그널 연결
-    # ──────────────────────────────────────────────────────────────
-    def _connect_signals(self) -> None:
-        self.OnEventConnect.connect(self._on_event_connect)
-        self.OnReceiveTrData.connect(self._on_receive_tr_data)
-        self.OnReceiveRealData.connect(self._on_receive_real_data)
-        self.OnReceiveChejanData.connect(self._on_receive_chejan_data)
-        self.OnReceiveMsg.connect(self._on_receive_msg)
-
-    # ──────────────────────────────────────────────────────────────
-    # 로그인
-    # ──────────────────────────────────────────────────────────────
-    def login(self) -> bool:
-        self.dynamicCall("CommConnect()")
-        self._login_loop.exec_()
-        return self.get_connect_state() == 1
-
-    def logout(self) -> None:
-        self.dynamicCall("CommTerminate()")
+    async def _get_token(self) -> str:
+        if self._token is None or _time.monotonic() >= self._token_expires_at:
+            await self._refresh_token()
+        return self._token  # type: ignore[return-value]
 
     def get_connect_state(self) -> int:
-        return self.dynamicCall("GetConnectState()")
+        return 1 if self._token else 0
 
     # ──────────────────────────────────────────────────────────────
-    # TR 요청 코어
+    # HTTP 요청 헬퍼
     # ──────────────────────────────────────────────────────────────
-    def _send_tr(
-        self,
-        rq_name: str,
-        tr_code: str,
-        screen_no: str,
-        inputs: Dict[str, str],
-        prev_next: int = 0,
-    ) -> Dict[str, Any]:
+    async def _get(self, path: str, params: Dict[str, str], tr_id: str) -> Dict:
         self._rate_limiter.wait_tr()
-        for key, value in inputs.items():
-            self.dynamicCall("SetInputValue(QString, QString)", key, value)
-        ret = self.dynamicCall(
-            "CommRqData(QString, QString, int, QString)",
-            rq_name, tr_code, prev_next, screen_no,
-        )
-        if ret != 0:
-            raise KiwoomTRError(f"CommRqData 오류 {ret}: {tr_code}")
-        self._tr_data = {}
-        self._tr_loop.exec_()
-        return self._tr_data
-
-    def get_comm_data(self, tr_code: str, record_name: str, index: int, item_name: str) -> str:
-        return self.dynamicCall(
-            "GetCommData(QString, QString, int, QString)",
-            tr_code, record_name, index, item_name,
-        ).strip()
-
-    def get_repeat_cnt(self, tr_code: str, record_name: str) -> int:
-        return self.dynamicCall("GetRepeatCnt(QString, QString)", tr_code, record_name)
-
-    # ──────────────────────────────────────────────────────────────
-    # 콜백 슬롯
-    # ──────────────────────────────────────────────────────────────
-    def _on_event_connect(self, err_code: int) -> None:
-        if err_code == 0:
-            logger.info("키움 로그인 성공")
-        else:
-            logger.error(f"키움 로그인 실패: {err_code}")
-        self._login_loop.exit(err_code)
-
-    def _on_receive_tr_data(
-        self, screen_no, rq_name, tr_code, record_name,
-        prev_next, data_len, err_code, msg, spl_msg,
-    ) -> None:
-        self._tr_data = {
-            "tr_code": tr_code,
-            "record_name": record_name,
-            "prev_next": prev_next,
+        token = await self._get_token()
+        client = await self._get_client()
+        headers = {
+            "authorization": f"Bearer {token}",
+            "appkey": self.config.app_key,
+            "appsecret": self.config.app_secret,
+            "tr_id": tr_id,
+            "custtype": "P",
         }
-        self._tr_loop.exit(0)
+        try:
+            resp = await client.get(path, params=params, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            raise KiwoomTRError(f"HTTP {e.response.status_code}: {e.response.text}") from e
 
-    def _on_receive_real_data(self, code: str, real_type: str, real_data: str) -> None:
-        if real_type in self._real_callbacks:
-            self._real_callbacks[real_type](code, real_data)
-
-    def _on_receive_chejan_data(self, gubun: str, item_cnt: int, fid_list: str) -> None:
-        data = {}
-        for fid in fid_list.split(";"):
-            if fid:
-                data[fid] = self.dynamicCall("GetChejanData(int)", int(fid))
-        logger.debug(f"체결잔고 수신: gubun={gubun}, 데이터={data}")
-
-    def _on_receive_msg(self, screen_no, rq_name, tr_code, msg) -> None:
-        logger.debug(f"키움 메시지 [{tr_code}]: {msg}")
+    async def _post(self, path: str, body: Dict, tr_id: str) -> Dict:
+        self._rate_limiter.wait_tr()
+        token = await self._get_token()
+        client = await self._get_client()
+        headers = {
+            "authorization": f"Bearer {token}",
+            "appkey": self.config.app_key,
+            "appsecret": self.config.app_secret,
+            "tr_id": tr_id,
+            "custtype": "P",
+        }
+        try:
+            resp = await client.post(path, json=body, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            raise KiwoomOrderError(f"HTTP {e.response.status_code}: {e.response.text}") from e
 
     # ──────────────────────────────────────────────────────────────
-    # 종목 정보 조회
+    # 시장 데이터
     # ──────────────────────────────────────────────────────────────
-    def get_popular_stocks(self, top_n: int = 20, market: str = "001") -> List[Dict[str, str]]:
-        """OPT10030: 거래량 상위 종목 조회"""
-        self._send_tr(
-            rq_name="거래량상위요청",
-            tr_code=TR.VOLUME_RANK,
-            screen_no=Screen.POPULAR_STOCKS,
-            inputs={
-                "시장구분": market,
-                "정렬구분": "1",       # 1: 거래량, 2: 거래대금
-                "관리종목포함": "0",
-                "신용구분": "0",
-                "거래량구분": "5",
+    async def get_popular_stocks(self, top_n: int = 20, market: str = "J") -> List[Dict[str, str]]:
+        """거래량 상위 종목 조회"""
+        data = await self._get(
+            self.VOLUME_PATH,
+            params={
+                "FID_COND_MRKT_DIV_CODE": market,
+                "FID_COND_SCR_DIV_CODE": "20171",
+                "FID_INPUT_ISCD": "0000",
+                "FID_DIV_CLS_CODE": "0",
+                "FID_BLNG_CLS_CODE": "0",
+                "FID_TRGT_CLS_CODE": "111111111",
+                "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+                "FID_INPUT_PRICE_1": "",
+                "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": str(top_n),
+                "FID_INPUT_DATE_1": "",
             },
+            tr_id="FHPST01710000",
         )
-        tr_code = TR.VOLUME_RANK
-        record_name = "거래량상위요청"
-        count = min(self.get_repeat_cnt(tr_code, record_name), top_n)
-        stocks = []
-        for i in range(count):
-            code = self.get_comm_data(tr_code, record_name, i, "종목코드").lstrip("A")
-            name = self.get_comm_data(tr_code, record_name, i, "종목명")
-            price = self.get_comm_data(tr_code, record_name, i, "현재가").lstrip("+-")
-            volume = self.get_comm_data(tr_code, record_name, i, "거래량")
-            if code:
-                stocks.append({"code": code, "name": name, "price": price, "volume": volume})
-        return stocks
+        output = data.get("output", [])
+        return [
+            {
+                "code":   item.get("mksc_shrn_iscd", "").lstrip("A"),
+                "name":   item.get("hts_kor_isnm", ""),
+                "price":  item.get("stck_prpr", "0"),
+                "volume": item.get("acml_vol", "0"),
+            }
+            for item in output[:top_n]
+            if item.get("mksc_shrn_iscd")
+        ]
 
-    def get_net_buy_stocks(self, top_n: int = 40, market: str = "001") -> List[Dict[str, str]]:
-        """OPT10023: 외국인/기관 순매수 상위 종목"""
-        self._send_tr(
-            rq_name="외국인기관순매수",
-            tr_code=TR.NET_BUY_RANK,
-            screen_no=Screen.POPULAR_STOCKS,
-            inputs={
-                "시장구분": market,
-                "날짜": today_str(),
-                "금액수량구분": "1",   # 1: 금액
-                "매매구분": "0",       # 0: 순매수
-                "단위구분": "1000",
+    async def get_net_buy_stocks(self, top_n: int = 40, market: str = "J") -> List[Dict[str, str]]:
+        """외국인/기관 순매수 상위 종목"""
+        data = await self._get(
+            self.NETBUY_PATH,
+            params={
+                "FID_COND_MRKT_DIV_CODE": market,
+                "FID_COND_SCR_DIV_CODE": "20227",
+                "FID_INPUT_ISCD": "0000",
+                "FID_DIV_CLS_CODE": "0",
+                "FID_BLNG_CLS_CODE": "0",
+                "FID_TRGT_CLS_CODE": "111111111",
+                "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+                "FID_INPUT_PRICE_1": "",
+                "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": str(top_n),
+                "FID_INPUT_DATE_1": today_str(),
             },
+            tr_id="FHPST02270000",
         )
-        tr_code = TR.NET_BUY_RANK
-        record_name = "외국인기관순매수"
-        count = min(self.get_repeat_cnt(tr_code, record_name), top_n)
-        stocks = []
-        for i in range(count):
-            code = self.get_comm_data(tr_code, record_name, i, "종목코드").lstrip("A")
-            name = self.get_comm_data(tr_code, record_name, i, "종목명")
-            if code:
-                stocks.append({"code": code, "name": name})
-        return stocks
+        output = data.get("output", [])
+        return [
+            {
+                "code": item.get("mksc_shrn_iscd", "").lstrip("A"),
+                "name": item.get("hts_kor_isnm", ""),
+            }
+            for item in output[:top_n]
+            if item.get("mksc_shrn_iscd")
+        ]
 
-    def get_stock_info(self, stock_code: str) -> Dict[str, Any]:
-        """OPT10001: 주식 기본정보 (현재가, PER, PBR, EPS, 시가총액)"""
-        self._send_tr(
-            rq_name="주식기본정보요청",
-            tr_code=TR.STOCK_BASIC_INFO,
-            screen_no=Screen.REAL_TIME,
-            inputs={"종목코드": stock_code},
+    async def get_stock_info(self, stock_code: str) -> Dict[str, Any]:
+        """주식 기본정보 (현재가, PER, PBR, EPS, 시가총액)"""
+        data = await self._get(
+            self.PRICE_PATH,
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": stock_code,
+            },
+            tr_id="FHKST01010100",
         )
-        tr_code = TR.STOCK_BASIC_INFO
-        record_name = "주식기본정보요청"
-
-        def _get(item: str) -> str:
-            return self.get_comm_data(tr_code, record_name, 0, item).lstrip("+-")
-
+        out = data.get("output", {})
         return {
-            "code": stock_code,
-            "name": _get("종목명"),
-            "current_price": _get("현재가"),
-            "market_cap": _get("시가총액"),
-            "per": _get("PER"),
-            "pbr": _get("PBR"),
-            "eps": _get("EPS"),
-            "listed_shares": _get("상장주식"),
-            "face_value": _get("액면가"),
+            "code":          stock_code,
+            "name":          out.get("hts_kor_isnm", ""),
+            "current_price": out.get("stck_prpr", "0"),
+            "market_cap":    out.get("hts_avls", ""),
+            "per":           out.get("per", "N/A"),
+            "pbr":           out.get("pbr", "N/A"),
+            "eps":           out.get("eps", "N/A"),
+            "listed_shares": out.get("lstn_stcn", ""),
+            "face_value":    out.get("stck_fcam", ""),
         }
 
-    def get_daily_ohlcv(
+    async def get_daily_ohlcv(
         self, stock_code: str, start_date: str = "", end_date: str = ""
     ) -> List[Dict[str, str]]:
-        """OPT10081: 일봉차트 데이터 (페이지네이션 처리)"""
+        """일봉 차트 조회 (최대 100일, 필요시 반복 호출)"""
         if not end_date:
             end_date = today_str()
         if not start_date:
             start_date = days_ago_str(120)
 
         all_rows: List[Dict[str, str]] = []
-        prev_next = 0
+        period_divcode = "D"  # 일봉
 
-        while True:
-            self._send_tr(
-                rq_name="일봉차트요청",
-                tr_code=TR.DAILY_OHLCV,
-                screen_no=Screen.REAL_TIME,
-                inputs={
-                    "종목코드": stock_code,
-                    "기준일자": end_date,
-                    "수정주가구분": "1",
-                },
-                prev_next=prev_next,
-            )
-            tr_code = TR.DAILY_OHLCV
-            record_name = "일봉차트요청"
-            count = self.get_repeat_cnt(tr_code, record_name)
-
-            for i in range(count):
-                row = {
-                    "date":   self.get_comm_data(tr_code, record_name, i, "일자"),
-                    "open":   self.get_comm_data(tr_code, record_name, i, "시가").lstrip("+-"),
-                    "high":   self.get_comm_data(tr_code, record_name, i, "고가").lstrip("+-"),
-                    "low":    self.get_comm_data(tr_code, record_name, i, "저가").lstrip("+-"),
-                    "close":  self.get_comm_data(tr_code, record_name, i, "현재가").lstrip("+-"),
-                    "volume": self.get_comm_data(tr_code, record_name, i, "거래량"),
-                }
-                if row["date"] >= start_date:
-                    all_rows.append(row)
-                else:
-                    return all_rows
-
-            if self._tr_data.get("prev_next") != "2":
-                break
-            prev_next = 2
-
+        data = await self._get(
+            self.DAILY_PATH,
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD":         stock_code,
+                "FID_INPUT_DATE_1":       start_date,
+                "FID_INPUT_DATE_2":       end_date,
+                "FID_PERIOD_DIV_CODE":    period_divcode,
+                "FID_ORG_ADJ_PRC":        "0",  # 수정주가 반영
+            },
+            tr_id="FHKST03010100",
+        )
+        output = data.get("output2", [])
+        for item in output:
+            date_val = item.get("stck_bsop_date", "")
+            if date_val >= start_date:
+                all_rows.append({
+                    "date":   date_val,
+                    "open":   item.get("stck_oprc", "0"),
+                    "high":   item.get("stck_hgpr", "0"),
+                    "low":    item.get("stck_lwpr", "0"),
+                    "close":  item.get("stck_clpr", "0"),
+                    "volume": item.get("acml_vol", "0"),
+                })
         return all_rows
 
-    def get_account_balance(self, account_no: str, password: str) -> Dict[str, Any]:
-        """OPW00004: 계좌 평가 잔고 내역"""
-        self._send_tr(
-            rq_name="계좌평가잔고내역요청",
-            tr_code=TR.ACCOUNT_BALANCE,
-            screen_no=Screen.PORTFOLIO,
-            inputs={
-                "계좌번호": account_no,
-                "비밀번호": password,
-                "비밀번호입력매체구분": "00",
-                "조회구분": "2",
+    async def get_account_balance(self, account_no: str, account_pw: str) -> Dict[str, Any]:
+        """계좌 평가 잔고 조회"""
+        data = await self._get(
+            self.BALANCE_PATH,
+            params={
+                "CANO":          account_no[:8],
+                "ACNT_PRDT_CD":  account_no[8:] if len(account_no) > 8 else "01",
+                "AFHR_FLPR_YN":  "N",
+                "OFL_YN":        "",
+                "INQR_DVSN":     "02",
+                "UNPR_DVSN":     "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN":     "01",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
             },
+            tr_id="TTTC8434R" if not self.config.is_simulated else "VTTC8434R",
         )
-        tr_code = TR.ACCOUNT_BALANCE
-        record_name = "계좌평가잔고내역요청"
+        output1 = data.get("output1", [])
+        output2 = data.get("output2", {})
 
-        def _single(item: str) -> str:
-            return self.get_comm_data(tr_code, "계좌평가결과", 0, item).lstrip("+-")
+        positions = [
+            {
+                "code":            item.get("pdno", ""),
+                "name":            item.get("prdt_name", ""),
+                "quantity":        item.get("hldg_qty", "0"),
+                "avg_price":       item.get("pchs_avg_pric", "0"),
+                "current_price":   item.get("prpr", "0"),
+                "evaluate_amount": item.get("evlu_amt", "0"),
+                "profit_loss":     item.get("evlu_pfls_amt", "0"),
+                "profit_rate":     item.get("evlu_pfls_rt", "0"),
+            }
+            for item in output1
+            if item.get("pdno")
+        ]
 
         summary = {
-            "total_purchase": _single("매입금액"),
-            "total_evaluate": _single("평가금액"),
-            "total_profit": _single("평가손익합계"),
-            "profit_rate": _single("수익률(%%)"),
-            "deposit": _single("예수금"),
+            "total_purchase": output2.get("pchs_amt_smtl_amt", "0"),
+            "total_evaluate": output2.get("evlu_amt_smtl_amt", "0"),
+            "total_profit":   output2.get("evlu_pfls_smtl_amt", "0"),
+            "profit_rate":    output2.get("tot_evlu_pfls_rt", "0"),
+            "deposit":        output2.get("dnca_tot_amt", "0"),
         }
-
-        count = self.get_repeat_cnt(tr_code, record_name)
-        positions = []
-        for i in range(count):
-            def _get(item: str) -> str:
-                return self.get_comm_data(tr_code, record_name, i, item).lstrip("+-")
-            code = _get("종목번호").lstrip("A")
-            if code:
-                positions.append({
-                    "code": code,
-                    "name": _get("종목명"),
-                    "quantity": _get("보유수량"),
-                    "avg_price": _get("매입가"),
-                    "current_price": _get("현재가"),
-                    "evaluate_amount": _get("평가금액"),
-                    "profit_loss": _get("평가손익"),
-                    "profit_rate": _get("수익률(%%)"),
-                })
-
         return {"summary": summary, "positions": positions}
 
-    def get_deposit(self, account_no: str, password: str) -> int:
-        """OPWPOA21: 주문 가능 예수금"""
-        self._send_tr(
-            rq_name="예수금상세현황요청",
-            tr_code=TR.ACCOUNT_DEPOSIT,
-            screen_no=Screen.PORTFOLIO,
-            inputs={
-                "계좌번호": account_no,
-                "비밀번호": password,
-                "비밀번호입력매체구분": "00",
-                "조회구분": "2",
+    async def get_deposit(self, account_no: str, account_pw: str) -> int:
+        """주문 가능 예수금"""
+        data = await self._get(
+            self.DEPOSIT_PATH,
+            params={
+                "CANO":         account_no[:8],
+                "ACNT_PRDT_CD": account_no[8:] if len(account_no) > 8 else "01",
+                "PDNO":         "005930",
+                "ORD_UNPR":     "0",
+                "ORD_DVSN":     "01",
+                "CMA_EVLU_AMT_ICLD_YN": "Y",
+                "OVRS_ICLD_YN": "N",
             },
+            tr_id="TTTC8908R" if not self.config.is_simulated else "VTTC8908R",
         )
-        raw = self.get_comm_data(TR.ACCOUNT_DEPOSIT, "예수금상세현황요청", 0, "주문가능금액")
-        return int(raw.lstrip("+-").replace(",", "") or "0")
+        raw = data.get("output", {}).get("ord_psbl_cash", "0")
+        return int(raw.replace(",", "") or 0)
 
-    def place_order(
+    async def place_order(
         self,
         order_type: int,
         stock_code: str,
@@ -329,47 +343,34 @@ class KiwoomAPI(QAxWidget):
         price_type: str = PriceType.MARKET,
         original_order_no: str = "",
     ) -> str:
-        """SendOrder: 주식 주문 (매수/매도/취소/정정)"""
-        ret = self.dynamicCall(
-            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            "주식주문",
-            Screen.ORDER,
-            account_no,
-            order_type,
-            stock_code,
-            quantity,
-            price,
-            price_type,
-            original_order_no,
-        )
-        if ret != 0:
-            raise KiwoomOrderError(f"SendOrder 오류 {ret}: {stock_code} {quantity}주")
+        # 모의투자/실거래 TR ID 구분
+        if not self.config.is_simulated:
+            tr_id = "TTTC0802U" if order_type == OrderType.BUY else "TTTC0801U"
+        else:
+            tr_id = "VTTC0802U" if order_type == OrderType.BUY else "VTTC0801U"
+
+        body = {
+            "CANO":          account_no[:8],
+            "ACNT_PRDT_CD":  account_no[8:] if len(account_no) > 8 else "01",
+            "PDNO":          stock_code,
+            "ORD_DVSN":      price_type,
+            "ORD_QTY":       str(quantity),
+            "ORD_UNPR":      str(price),
+        }
+        if original_order_no:
+            body["ORGN_ODNO"] = original_order_no
+
+        data = await self._post(self.ORDER_PATH, body, tr_id)
+        order_no = data.get("output", {}).get("ODNO", "")
         logger.info(
-            f"주문 전송: {'매수' if order_type == OrderType.BUY else '매도'} "
-            f"{stock_code} {quantity}주 @ {'시장가' if price == 0 else f'{price:,}원'}"
+            f"주문 완료: {'매수' if order_type == OrderType.BUY else '매도'} "
+            f"{stock_code} {quantity}주 @ {'시장가' if price == 0 else f'{price:,}원'} "
+            f"(주문번호={order_no})"
         )
-        return ""  # 실제 주문번호는 OnReceiveChejanData에서 수신
+        return order_no
 
-    def register_real_time(
-        self,
-        screen_no: str,
-        stock_codes: List[str],
-        fid_list: List[int],
-        real_type: str = "0",
-    ) -> None:
-        self._rate_limiter.wait_real()
-        codes_str = ";".join(stock_codes)
-        fids_str = ";".join(str(f) for f in fid_list)
-        self.dynamicCall(
-            "SetRealReg(QString, QString, QString, QString)",
-            screen_no, codes_str, fids_str, real_type,
-        )
-
-    def unregister_real_time(self, screen_no: str, stock_code: str = "") -> None:
-        self.dynamicCall("SetRealRemove(QString, QString)", screen_no, stock_code or "ALL")
-
-    def register_real_callback(self, real_type: str, callback: Callable) -> None:
+    def register_real_callback(self, real_type: str, callback: RealCallback) -> None:
         self._real_callbacks[real_type] = callback
 
     def get_master_stock_name(self, stock_code: str) -> str:
-        return self.dynamicCall("GetMasterStockName(QString)", stock_code)
+        return ""  # REST 환경에서는 get_stock_info() 사용

@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 import pytz
-from apscheduler.schedulers.qt import QtScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from config.settings import AppConfig
@@ -24,7 +24,7 @@ KST = pytz.timezone("Asia/Seoul")
 class TradingScheduler:
     """
     일과 스케줄 (KST):
-      08:50 — 사전 준비 (로그인 후 포트폴리오 동기화, AI 헬스체크, 인기 종목 조회)
+      08:50 — 사전 준비 (포트폴리오 동기화, AI 헬스체크, 인기 종목 조회)
       09:05~15:00 — 30분마다 분석 사이클
       14:50 — 신규 매수 중단
       15:00 — 전 포지션 강제 청산
@@ -55,18 +55,17 @@ class TradingScheduler:
         self.risk = risk_manager
         self.config = config
         self._target_stocks = []
-        self._loop = asyncio.get_event_loop()
-        self.scheduler = QtScheduler(timezone=KST)
+        self.scheduler = AsyncIOScheduler(timezone=KST)
         self._setup_jobs()
 
     def _setup_jobs(self) -> None:
         self.scheduler.add_job(
-            self._run_async(self.pre_market_setup),
+            self.pre_market_setup,
             CronTrigger(hour=8, minute=50, day_of_week="mon-fri", timezone=KST),
             id="pre_market",
         )
         self.scheduler.add_job(
-            self._run_async(self.analysis_cycle),
+            self.analysis_cycle,
             CronTrigger(
                 hour="9-14", minute="5,35",
                 day_of_week="mon-fri", timezone=KST,
@@ -89,24 +88,20 @@ class TradingScheduler:
             id="eod_report",
         )
 
-    def _run_async(self, coro_func):
-        """비동기 코루틴을 Qt 스케줄러 동기 콜백으로 감싼다."""
-        def wrapper():
-            self._loop.run_until_complete(coro_func())
-        return wrapper
-
     async def pre_market_setup(self) -> None:
         logger.info("=== 사전 준비 시작 ===")
         self.risk.reset_daily_counters()
-        self.portfolio.sync_from_kiwoom()
+        await self.portfolio.sync_from_kiwoom()
         self.portfolio.load_state()
         self.order_manager.resume_new_buys()
 
-        gpt_ok    = await self.gpt_analyzer.health_check()
-        gemini_ok = await self.gemini_analyzer.health_check()
+        gpt_ok, gemini_ok = await asyncio.gather(
+            self.gpt_analyzer.health_check(),
+            self.gemini_analyzer.health_check(),
+        )
         logger.info(f"AI 헬스체크: GPT={'OK' if gpt_ok else 'FAIL'}, Gemini={'OK' if gemini_ok else 'FAIL'}")
 
-        self._target_stocks = self.stock_selector.get_top_stocks(self.config.top_n_stocks)
+        self._target_stocks = await self.stock_selector.get_top_stocks(self.config.top_n_stocks)
         logger.info(f"오늘의 분석 대상: {[s['name'] for s in self._target_stocks]}")
 
     async def analysis_cycle(self) -> None:
@@ -118,13 +113,13 @@ class TradingScheduler:
         logger.info(f"=== 분석 사이클 시작 @ {now} KST ({len(self._target_stocks)}개 종목) ===")
 
         # 손절/익절 먼저 확인
-        self._check_stop_take_profits()
+        await self._check_stop_take_profits()
 
         # 종목별 AI 분석 및 주문
         for stock in self._target_stocks:
             code, name = stock["code"], stock["name"]
             try:
-                stock_data = self.market_data.fetch_stock_data(code, name)
+                stock_data = await self.market_data.fetch_stock_data(code, name)
 
                 gpt_result, gemini_result = await asyncio.gather(
                     self._safe_analyze(self.gpt_analyzer, stock_data),
@@ -137,20 +132,19 @@ class TradingScheduler:
                     min_confidence=self.config.risk.min_confidence,
                 )
 
+                gpt_info    = f"{gpt_result.action.value}({gpt_result.confidence:.2f})"    if gpt_result    else "ERR"
+                gemini_info = f"{gemini_result.action.value}({gemini_result.confidence:.2f})" if gemini_result else "ERR"
                 logger.info(
-                    f"[{name}] GPT={gpt_result.action.value if gpt_result else 'ERR'}"
-                    f"({gpt_result.confidence:.2f if gpt_result else 0:.2f}) "
-                    f"Gemini={gemini_result.action.value if gemini_result else 'ERR'}"
-                    f"({gemini_result.confidence:.2f if gemini_result else 0:.2f}) "
+                    f"[{name}] GPT={gpt_info} Gemini={gemini_info} "
                     f"→ {decision.final_action.value}({decision.combined_confidence:.2f})"
                 )
 
-                self.order_manager.execute_decision(decision)
+                await self.order_manager.execute_decision(decision)
 
             except Exception as e:
                 logger.error(f"분석 실패 [{name}({code})]: {e}", exc_info=True)
 
-        self.portfolio.sync_from_kiwoom()
+        await self.portfolio.sync_from_kiwoom()
         self.portfolio.save_state()
 
     async def _safe_analyze(self, analyzer, stock_data):
@@ -160,30 +154,31 @@ class TradingScheduler:
             logger.warning(f"{analyzer.__class__.__name__} 분석 실패 [{stock_data.name}]: {e}")
             return None
 
-    def _check_stop_take_profits(self) -> None:
+    async def _check_stop_take_profits(self) -> None:
         for code, position in list(self.portfolio._positions.items()):
             if self.risk.check_stop_loss(position.avg_buy_price, position.current_price):
                 logger.warning(f"손절 트리거: {position.name} ({position.unrealized_pnl_pct:.1%})")
-                self.order_manager.sell_by_stop_loss(code)
+                await self.order_manager.sell_by_stop_loss(code)
             elif self.risk.check_take_profit(position.avg_buy_price, position.current_price):
                 logger.info(f"익절 트리거: {position.name} ({position.unrealized_pnl_pct:.1%})")
-                self.order_manager.sell_by_stop_loss(code)  # 익절도 동일한 강제 매도 사용
+                await self.order_manager.sell_by_stop_loss(code)
 
-    def pre_close_stop_buys(self) -> None:
+    async def pre_close_stop_buys(self) -> None:
         logger.info("=== 장 마감 30분 전: 신규 매수 중단 ===")
         self.order_manager.stop_new_buys()
 
-    def close_all_positions(self) -> None:
+    async def close_all_positions(self) -> None:
         logger.info("=== 장 마감: 전체 포지션 청산 ===")
-        self.order_manager.close_all_positions()
+        await self.order_manager.close_all_positions()
 
-    def end_of_day_report(self) -> None:
-        self.portfolio.sync_from_kiwoom()
-        total = self.portfolio._total_value
-        cash  = self.portfolio._cash
+    async def end_of_day_report(self) -> None:
+        await self.portfolio.sync_from_kiwoom()
+        total    = self.portfolio._total_value
+        cash     = self.portfolio._cash
         positions = len(self.portfolio._positions)
-        history   = self.portfolio._trade_history
-        today_trades = [t for t in history if t.timestamp.startswith(now_kst().strftime("%Y-%m-%d"))]
+        history  = self.portfolio._trade_history
+        today_str_prefix = now_kst().strftime("%Y-%m-%d")
+        today_trades = [t for t in history if t.timestamp.startswith(today_str_prefix)]
         total_pnl = sum(t.pnl for t in today_trades if t.action == "SELL")
 
         logger.info(
