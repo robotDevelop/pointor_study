@@ -1,0 +1,42 @@
+kiwoom:
+  account_number: ""        # env: KIWOOM_ACCOUNT
+  account_password: ""      # env: KIWOOM_ACCOUNT_PW
+  cert_password: ""         # env: KIWOOM_CERT_PW
+  is_simulated: true        # true = 모의투자, false = 실계좌
+  tr_delay_ms: 200
+  real_delay_ms: 500
+
+openai:
+  api_key: ""               # env: OPENAI_API_KEY
+  model: "gpt-4o"
+  max_tokens: 1000
+  temperature: 0.3
+  timeout: 30
+
+gemini:
+  api_key: ""               # env: GEMINI_API_KEY
+  model: "gemini-1.5-pro"
+  max_tokens: 1000
+  temperature: 0.3
+  timeout: 30
+
+risk:
+  max_positions: 5
+  max_position_pct: 0.10
+  max_total_exposure_pct: 0.50
+  stop_loss_pct: 0.03
+  take_profit_pct: 0.05
+  min_confidence: 0.70
+  max_daily_trades: 10
+
+scheduler:
+  market_open: "09:05"
+  market_close: "15:20"
+  analysis_interval_min: 30
+  pre_close_minutes: 30
+  timezone: "Asia/Seoul"
+
+top_n_stocks: 20
+log_level: "INFO"
+log_dir: "logs"
+data_dir: "data"
