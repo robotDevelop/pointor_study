@@ -1,0 +1,28 @@
+# AI APIs
+openai>=1.30.0
+google-generativeai>=0.7.0
+
+# Kiwoom REST API & HTTP 클라이언트
+httpx[http2]>=0.27.0
+
+# 시장 데이터 (KRX 공식 데이터 — 테스트/개발용 fallback)
+pykrx>=1.0.45
+
+# Data & Technical Analysis
+pandas>=2.0.0
+numpy>=1.26.0
+
+# Scheduler
+APScheduler>=3.10.4
+
+# Config & Env
+PyYAML>=6.0.1
+python-dotenv>=1.0.0
+
+# Timezone
+pytz>=2024.1
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0

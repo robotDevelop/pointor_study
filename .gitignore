@@ -1,52 +1,38 @@
-# Prerequisites
-*.d
-
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 *.so
-*.so.*
-*.dylib
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+env/
+venv/
+.venv/
+pip-wheel-metadata/
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+# Environment / Secrets
+.env
+*.env.local
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# Logs & Data
+logs/*.log
+logs/*.json
+data/cache/
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kiwoom
+KHOpenAPI.log
